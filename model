@@ -1,1 +1,692 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import re
+
+
+FREQ_BANDS = {
+    'delta': (1, 4),
+    'theta': (4, 8),
+    'alpha': (8, 13),
+    'beta': (13, 30),
+    'gamma': (30, 45)
+}
+
+
+def compute_band_power(signal, sample_rate, reduce_channels=False):
+    fft = torch.fft.rfft(signal, dim=-1)
+    power_spectrum = torch.abs(fft) ** 2
+    freqs = torch.fft.rfftfreq(signal.size(-1), d=1./sample_rate).to(signal.device)
+
+    band_powers = []
+    for band in ['delta', 'theta', 'alpha', 'beta', 'gamma']:
+        fmin, fmax = FREQ_BANDS[band]
+        idx = (freqs >= fmin) & (freqs < fmax)
+        band_power = power_spectrum[..., idx].mean(dim=-1)
+        band_powers.append(band_power)
+
+    band_powers = torch.stack(band_powers, dim=-1)
+    if reduce_channels:
+        band_powers = band_powers.mean(dim=1)
+    return band_powers
+
+
+class LearnableFilterBank(nn.Module):
+    def __init__(self, input_channels, sample_rate, num_filters=5, kernel_size=251):
+        super(LearnableFilterBank, self).__init__()
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        self.input_channels = input_channels
+        self.num_filters = num_filters
+        self.sample_rate = float(sample_rate)
+        self.filterbank = nn.Conv1d(
+            input_channels,
+            input_channels * num_filters,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=input_channels,
+            bias=False,
+        )
+        self._init_eeg_filterbank()
+
+    def _init_eeg_filterbank(self):
+        centers = [2.5, 6.0, 10.5, 21.5, 37.5][:self.num_filters]
+        kernel_size = self.filterbank.kernel_size[0]
+        center = (kernel_size - 1) / 2.0
+        times = (torch.arange(kernel_size, dtype=torch.float32) - center) / self.sample_rate
+        window = torch.hann_window(kernel_size, periodic=False)
+
+        weight = torch.zeros_like(self.filterbank.weight.data)
+        nyquist = self.sample_rate / 2.0
+        for channel_idx in range(self.input_channels):
+            for filter_idx, freq in enumerate(centers):
+                freq = min(freq, nyquist * 0.9)
+                filt = torch.cos(2.0 * torch.pi * freq * times) * window
+                filt = filt - filt.mean()
+                filt = filt / (filt.norm() + 1e-6)
+                weight[channel_idx * self.num_filters + filter_idx, 0, :] = filt
+
+        with torch.no_grad():
+            self.filterbank.weight.copy_(weight)
+
+    def forward(self, x):
+        filtered = self.filterbank(x)
+        batch_size = filtered.size(0)
+        filtered = filtered.view(
+            batch_size,
+            self.input_channels,
+            self.num_filters,
+            filtered.size(-1),
+        )
+        return filtered.pow(2).mean(dim=-1)
+
+
+class DenseBlock(nn.Module):
+    def __init__(self, in_channels, num_layers, growth_rate):
+        super(DenseBlock, self).__init__()
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            layer = self._make_layer(in_channels + i * growth_rate, growth_rate)
+            self.layers.append(layer)
+
+    def _make_layer(self, in_channels, growth_rate):
+        layer = nn.Sequential(
+            nn.Conv1d(in_channels, growth_rate, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(growth_rate),
+            nn.ReLU()
+        )
+        return layer
+
+    def forward(self, x):
+        for layer in self.layers:
+            out = layer(x)
+            x = torch.cat([x, out], dim=1)
+        return x
+
+
+class _MontageTokenEncoder(nn.Module):
+
+
+    def __init__(self, feature_dim=32, num_temporal_states=4, num_montage_tokens=5):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.num_temporal_states = int(num_temporal_states)
+        self.num_montage_tokens = int(num_montage_tokens)
+        self.state_norm = nn.LayerNorm(self.feature_dim)
+        self.token_projection = nn.Linear(
+            self.feature_dim, self.num_montage_tokens * self.feature_dim
+        )
+
+    def _to_montage_tokens(self, sequence):
+
+        states = F.adaptive_avg_pool1d(
+            sequence.transpose(1, 2), self.num_temporal_states
+        ).transpose(1, 2)
+        tokens = self.token_projection(self.state_norm(states))
+        return tokens.reshape(
+            sequence.size(0),
+            self.num_temporal_states,
+            self.num_montage_tokens,
+            self.feature_dim,
+        )
+
+
+class _MultiScaleTemporalBlock(nn.Module):
+
+
+    def __init__(self, input_channels, temporal_kernel, out_channels=16,
+                 temporal_channels=8, dropout=0.25):
+        super().__init__()
+
+
+        spatial_groups = math.gcd(int(temporal_channels), int(out_channels))
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                1, temporal_channels, kernel_size=(1, temporal_kernel),
+                padding=(0, temporal_kernel // 2), bias=False,
+            ),
+            nn.BatchNorm2d(temporal_channels),
+            nn.Conv2d(
+                temporal_channels, out_channels, kernel_size=(input_channels, 1),
+                groups=spatial_groups, bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 8)),
+            nn.Dropout(dropout),
+            nn.Conv2d(
+                out_channels, out_channels, kernel_size=(1, 15), padding=(0, 7),
+                groups=out_channels, bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 4)),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.block(x).squeeze(2)
+
+
+class MontageTokenEncoder(_MontageTokenEncoder):
+
+
+    def __init__(self, input_channels, feature_dim=32, num_temporal_states=4,
+                 dropout=0.25, scale_channels=16, temporal_channels=8):
+        super().__init__(feature_dim, num_temporal_states)
+        self.scales = nn.ModuleList([
+            _MultiScaleTemporalBlock(
+                input_channels, kernel,
+                out_channels=scale_channels,
+                temporal_channels=temporal_channels,
+                dropout=dropout,
+            )
+            for kernel in (15, 31, 63, 125)
+        ])
+        self.projection = nn.Conv1d(
+            scale_channels * 4, feature_dim, kernel_size=1, bias=False
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=feature_dim,
+            nhead=4,
+            dim_feedforward=feature_dim * 2,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(layer, num_layers=1)
+        self.output_norm = nn.LayerNorm(feature_dim)
+
+    @staticmethod
+    def _sinusoidal_positions(length, dim, device, dtype):
+        positions = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)
+        frequencies = torch.exp(
+            torch.arange(0, dim, 2, device=device, dtype=dtype)
+            * (-math.log(10000.0) / dim)
+        )
+        encoding = torch.zeros(length, dim, device=device, dtype=dtype)
+        encoding[:, 0::2] = torch.sin(positions * frequencies)
+        encoding[:, 1::2] = torch.cos(positions * frequencies)
+        return encoding
+
+    def forward(self, x):
+        montage = x.unsqueeze(1)
+        sequence = torch.cat([scale(montage) for scale in self.scales], dim=1)
+        sequence = self.projection(sequence)
+        sequence = sequence.transpose(1, 2)
+        sequence = sequence + self._sinusoidal_positions(
+            sequence.size(1), sequence.size(2), sequence.device, sequence.dtype
+        ).unsqueeze(0)
+        sequence = self.output_norm(self.temporal_encoder(sequence))
+        return self._to_montage_tokens(sequence)
+
+
+class SpectralRegionMontageMatcher(nn.Module):
+
+
+    def __init__(
+        self,
+        input_channels,
+        lead_indices_list,
+        feature_dim=32,
+        num_temporal_states=4,
+        dropout=0.25,
+        sinkhorn_iterations=5,
+        scale_channels=16,
+        temporal_channels=8,
+    ):
+        super().__init__()
+        self.num_regions = len(lead_indices_list)
+        self.feature_dim = int(feature_dim)
+        self.num_temporal_states = int(num_temporal_states)
+        self.sinkhorn_iterations = int(sinkhorn_iterations)
+        self.lead_indices_list = tuple(tuple(indices) for indices in lead_indices_list)
+        self.montage_encoder = MontageTokenEncoder(
+            input_channels, feature_dim, num_temporal_states, dropout,
+            scale_channels=scale_channels,
+            temporal_channels=temporal_channels,
+        )
+        self.temporal_position = nn.Parameter(
+            torch.empty(1, num_temporal_states, 1, feature_dim)
+        )
+        nn.init.normal_(self.temporal_position, mean=0.0, std=0.02)
+        self.regional_norm = nn.LayerNorm(feature_dim)
+        self.spectral_projection = nn.Sequential(
+            nn.LayerNorm(5),
+            nn.Linear(5, feature_dim),
+            nn.GELU(),
+        )
+        self.query = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.key = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.value = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.feature_fusion = nn.Sequential(
+            nn.LayerNorm(feature_dim * 4),
+            nn.Linear(feature_dim * 4, feature_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim * 2, feature_dim),
+        )
+        total_dim = self.num_regions * feature_dim
+        self.temporal_scorer = nn.Sequential(
+            nn.LayerNorm(total_dim),
+            nn.Linear(total_dim, feature_dim * 2),
+            nn.Tanh(),
+            nn.Linear(feature_dim * 2, 1),
+        )
+
+    def _regional_states(self, regional_temporal_features):
+        batch_size, num_regions, feature_dim, time_steps = regional_temporal_features.shape
+        if num_regions != self.num_regions or feature_dim != self.feature_dim:
+            raise ValueError(
+                "Unexpected regional features for the montage matcher: expected "
+                f"R={self.num_regions}, D={self.feature_dim}, got R={num_regions}, D={feature_dim}"
+            )
+        states = F.adaptive_avg_pool1d(
+            regional_temporal_features.reshape(batch_size * num_regions, feature_dim, time_steps),
+            self.num_temporal_states,
+        )
+        return states.reshape(
+            batch_size, num_regions, feature_dim, self.num_temporal_states
+        ).permute(0, 3, 1, 2).contiguous()
+
+    def _regional_spectral_condition(self, band_power):
+        regional_power = torch.stack([
+            band_power[:, list(indices), :].mean(dim=1)
+            for indices in self.lead_indices_list
+        ], dim=1)
+        relative_power = regional_power / (regional_power.sum(dim=-1, keepdim=True) + 1e-6)
+        return self.spectral_projection(torch.log(relative_power + 1e-6))
+
+    def _sinkhorn(self, logits):
+        matrix = torch.exp(logits - logits.amax(dim=(-2, -1), keepdim=True)).clamp_min(1e-6)
+        for _ in range(self.sinkhorn_iterations):
+            matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + 1e-6)
+            matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + 1e-6)
+        return matrix
+
+    def forward(self, regional_temporal_features, raw_x, band_power):
+        states = self._regional_states(regional_temporal_features) + self.temporal_position
+        spectral_condition = self._regional_spectral_condition(band_power)
+        spectral_states = spectral_condition.unsqueeze(1).expand(
+            -1, self.num_temporal_states, -1, -1
+        )
+        montage_tokens = self.montage_encoder(raw_x)
+        queries = self.query(self.regional_norm(states) + spectral_states)
+        keys = self.key(montage_tokens)
+        alignment = self._sinkhorn(
+            torch.matmul(queries, keys.transpose(-1, -2)) / math.sqrt(self.feature_dim)
+        )
+        aligned_montage = torch.matmul(alignment, self.value(montage_tokens))
+        fused_states = self.feature_fusion(torch.cat([
+            states, spectral_states, aligned_montage, states * aligned_montage
+        ], dim=-1))
+        flattened_states = fused_states.reshape(
+            fused_states.size(0), self.num_temporal_states, -1
+        )
+        weights = torch.softmax(self.temporal_scorer(flattened_states).squeeze(-1), dim=1)
+        global_feature = torch.sum(flattened_states * weights.unsqueeze(-1), dim=1)
+        return global_feature, alignment, weights, montage_tokens
+
+
+class RegionalSpectralEncoder(nn.Module):
+
+
+    def __init__(self, configs=None):
+        super().__init__()
+        self.num_classes = getattr(configs, "num_classes", 2)
+        input_channels = getattr(configs, "input_channels", 16)
+        self.sample_rate_orig = float(getattr(configs, "sfreq", 500.0))
+        self.sample_rate_mid = float(getattr(configs, "specam_mid_sfreq", self.sample_rate_orig / 2.0))
+        self.ch_names = getattr(configs, "ch_names", None)
+        self.lead_indices_list = self._get_lead_indices(input_channels, self.ch_names)
+        self.lateral_pairs, self.left_indices, self.right_indices = self._get_lateral_indices(
+            input_channels, self.ch_names
+        )
+        self.register_buffer(
+            "lateral_left_pair_idx",
+            torch.tensor([left for left, _ in self.lateral_pairs], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lateral_right_pair_idx",
+            torch.tensor([right for _, right in self.lateral_pairs], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hemisphere_left_idx",
+            torch.tensor(self.left_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hemisphere_right_idx",
+            torch.tensor(self.right_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.lead_branches = nn.ModuleList([
+            self._make_cnn_branch(in_channels=len(indices))
+            for indices in self.lead_indices_list
+        ])
+
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(0.5)
+        self.flatten = nn.Flatten()
+        self.last_regional_interactions = None
+        self.last_temporal_attention = None
+        self.last_anatomy_montage_alignment = None
+
+
+        self.learnable_filterbank = LearnableFilterBank(
+            input_channels=input_channels,
+            sample_rate=self.sample_rate_orig,
+            num_filters=5,
+            kernel_size=getattr(configs, "specam_filter_kernel_size", 251),
+        )
+
+        stroke_feature_dim = self._stroke_spectral_feature_dim(input_channels)
+        self.stroke_feature_proj = nn.Sequential(
+            nn.LayerNorm(stroke_feature_dim),
+            nn.Linear(stroke_feature_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(float(getattr(configs, "specam_spectral_dropout", 0.2))),
+        )
+        self.mid_features_list = [None] * len(self.lead_indices_list)
+        self.original_x_list = [None] * len(self.lead_indices_list)
+
+        for branch_idx in range(len(self.lead_branches)):
+            def create_hook(idx):
+                def hook_fn(m, i, o):
+                    self.mid_features_list[idx] = o
+                return hook_fn
+            target_layer = self.lead_branches[branch_idx][10]
+            target_layer.register_forward_hook(create_hook(branch_idx))
+
+    def _get_lead_indices(self, input_channels, ch_names=None):
+        if ch_names is not None:
+
+
+            groups = {"frontal": [], "central": [], "parietal": [], "occipital": [], "temporal": []}
+            for idx, raw_name in enumerate(ch_names):
+                name = re.sub(r"[^A-Za-z0-9]", "", str(raw_name)).upper()
+                if name.startswith(("FP", "AF", "F")) and not name.startswith("FC"):
+                    group = "frontal"
+                elif name.startswith(("FC", "C")):
+                    group = "central"
+                elif name.startswith(("CP", "P")) and not name.startswith("PO"):
+                    group = "parietal"
+                elif name.startswith(("PO", "O")):
+                    group = "occipital"
+                elif name.startswith(("TP", "T")):
+                    group = "temporal"
+                else:
+                    raise ValueError(f"Cannot assign EEG channel to an anatomical region: {raw_name}")
+                groups[group].append(idx)
+            lead_indices = [groups[key] for key in ("frontal", "central", "parietal", "occipital", "temporal")]
+            empty_regions = [key for key, indices in zip(groups, lead_indices) if not indices]
+            if empty_regions:
+                raise ValueError(f"Missing channels for anatomical regions: {empty_regions}")
+            return lead_indices
+
+        if input_channels == 16:
+            return [
+                [0, 1, 2, 3, 4],
+                [6, 7, 8],
+                [10, 11, 12],
+                [13, 14, 15],
+                [5, 9],
+            ]
+
+
+        raise ValueError(f"No anatomical lead groups are defined for {input_channels} channels")
+
+    def _get_lateral_indices(self, input_channels, ch_names=None):
+        standard_pairs = [
+            ("FP1", "FP2"),
+            ("F3", "F4"),
+            ("C3", "C4"),
+            ("P3", "P4"),
+            ("O1", "O2"),
+            ("T7", "T8"),
+            ("F7", "F8"),
+            ("T3", "T4"),
+            ("T5", "T6"),
+        ]
+        left_names = {"FP1", "F3", "C3", "P3", "O1", "T7", "F7", "T3", "T5"}
+        right_names = {"FP2", "F4", "C4", "P4", "O2", "T8", "F8", "T4", "T6"}
+
+        if ch_names is not None:
+            name_to_index = {str(name).upper(): idx for idx, name in enumerate(ch_names)}
+            pairs = [
+                (name_to_index[left], name_to_index[right])
+                for left, right in standard_pairs
+                if left in name_to_index and right in name_to_index
+            ]
+            left_indices = [name_to_index[name] for name in left_names if name in name_to_index]
+            right_indices = [name_to_index[name] for name in right_names if name in name_to_index]
+            return pairs, sorted(left_indices), sorted(right_indices)
+
+        if input_channels == 16:
+            return (
+                [(0, 1), (2, 4), (6, 8), (10, 12), (13, 15), (5, 9)],
+                [0, 2, 5, 6, 10, 13],
+                [1, 4, 8, 9, 12, 15],
+            )
+
+
+        return [], [], []
+
+    def _stroke_spectral_feature_dim(self, input_channels):
+        channel_metrics = 7
+        dim = input_channels * channel_metrics
+        dim += len(self.lateral_pairs) * channel_metrics * 2
+        if self.left_indices and self.right_indices:
+            dim += channel_metrics * 4
+        return dim
+
+    def _make_cnn_branch(self, in_channels):
+        layers = []
+        layers.append(nn.Conv1d(in_channels, 32, kernel_size=100, stride=2))
+        layers.append(nn.BatchNorm1d(32))
+        layers.append(nn.ReLU())
+        layers.append(nn.MaxPool1d(kernel_size=2, stride=1))
+
+        layers.append(nn.Conv1d(in_channels=32, out_channels=32, kernel_size=22, stride=1, groups=32))
+        layers.append(nn.Conv1d(in_channels=32, out_channels=32, kernel_size=1, stride=1))
+        layers.append(nn.BatchNorm1d(32))
+        layers.append(nn.ReLU())
+        layers.append(nn.MaxPool1d(kernel_size=2, stride=1))
+
+
+        layers.append(DenseBlock(32, num_layers=2, growth_rate=16))
+        layers.append(nn.Conv1d(32 + 2 * 16, 32, kernel_size=1, stride=1))
+
+        layers.append(nn.ReLU())
+        layers.append(nn.MaxPool1d(kernel_size=2, stride=2))
+
+
+        layers.append(DenseBlock(32, num_layers=7, growth_rate=16))
+        layers.append(nn.Conv1d(32 + 7 * 16, 16, kernel_size=1, stride=1))
+        layers.append(nn.ReLU())
+        layers.append(nn.MaxPool1d(kernel_size=2, stride=4))
+
+
+        layers.append(DenseBlock(16, num_layers=2, growth_rate=8))
+        layers.append(nn.MaxPool1d(kernel_size=2, stride=2))
+
+        return nn.Sequential(*layers)
+
+    def _relative_band_power(self, band_power):
+        return band_power / (band_power.sum(dim=-1, keepdim=True) + 1e-6)
+
+    def _stroke_ratio_metrics(self, relative_band_power):
+        delta = relative_band_power[..., 0]
+        theta = relative_band_power[..., 1]
+        alpha = relative_band_power[..., 2]
+        beta = relative_band_power[..., 3]
+        dar = delta / (alpha + 1e-6)
+        dtabr = (delta + theta) / (alpha + beta + 1e-6)
+        return torch.stack([dar, dtabr], dim=-1)
+
+    def _extract_stroke_spectral_features(self, x, band_power=None):
+        if band_power is None:
+            band_power = self.learnable_filterbank(x)
+        relative_band_power = self._relative_band_power(band_power)
+        ratio_metrics = self._stroke_ratio_metrics(relative_band_power)
+        log_metrics = torch.log(
+            torch.cat([relative_band_power, ratio_metrics], dim=-1) + 1e-6
+        )
+
+        features = [log_metrics.flatten(start_dim=1)]
+
+        if self.lateral_pairs:
+            pair_diff = (
+                log_metrics.index_select(1, self.lateral_left_pair_idx)
+                - log_metrics.index_select(1, self.lateral_right_pair_idx)
+            )
+            features.extend([pair_diff.flatten(start_dim=1), pair_diff.abs().flatten(start_dim=1)])
+
+        if self.left_indices and self.right_indices:
+            left_mean = log_metrics.index_select(1, self.hemisphere_left_idx).mean(dim=1)
+            right_mean = log_metrics.index_select(1, self.hemisphere_right_idx).mean(dim=1)
+            hemisphere_diff = left_mean - right_mean
+            features.extend([left_mean, right_mean, hemisphere_diff, hemisphere_diff.abs()])
+
+        return torch.cat(features, dim=1)
+
+    def compute_spectral_consistency_loss(self, mid_features, original_signal,
+                                          sample_rate_mid=100, sample_rate_orig=200):
+
+        mid_band_power = compute_band_power(mid_features, sample_rate_mid, reduce_channels=False)
+        original_band_power = compute_band_power(original_signal, sample_rate_orig, reduce_channels=False)
+
+        mid_summary = self._spectral_constraint_summary(mid_band_power)
+        original_summary = self._spectral_constraint_summary(original_band_power)
+
+        per_band_mse = (
+            torch.log(mid_summary + 1e-6) - torch.log(original_summary + 1e-6)
+        ).pow(2).mean(dim=0)
+        weights = 1.0 / (per_band_mse.detach() + 1e-6)
+        weights = weights / weights.sum()
+
+        return (weights * per_band_mse).sum()
+
+    def _spectral_constraint_summary(self, band_power):
+        relative_band_power = self._relative_band_power(band_power)
+        ratio_metrics = self._stroke_ratio_metrics(relative_band_power)
+
+        band_mean = relative_band_power.mean(dim=1)
+        band_std = relative_band_power.std(dim=1, unbiased=False)
+        ratio_mean = ratio_metrics.mean(dim=1)
+        ratio_std = ratio_metrics.std(dim=1, unbiased=False)
+
+        return torch.cat([band_mean, band_std, ratio_mean, ratio_std], dim=-1)
+
+
+class SpectralRegionFusion(RegionalSpectralEncoder):
+
+
+    def __init__(self, configs=None, fusion_gate_init=0.1, scale_channels=16,
+                 temporal_channels=8):
+        super().__init__(configs=configs)
+        input_channels = getattr(configs, "input_channels", 16)
+        num_temporal_states = int(getattr(configs, "specam_num_temporal_states", 8))
+        matcher_dropout = float(getattr(configs, "specam_matcher_dropout", 0.25))
+
+        self.anatomy_montage_correspondence = SpectralRegionMontageMatcher(
+            input_channels=input_channels,
+            lead_indices_list=self.lead_indices_list,
+            feature_dim=32,
+            num_temporal_states=num_temporal_states,
+            dropout=matcher_dropout,
+            sinkhorn_iterations=int(getattr(configs, "specam_sinkhorn_iterations", 8)),
+            scale_channels=int(getattr(configs, "specam_scale_channels", scale_channels)),
+            temporal_channels=int(getattr(configs, "specam_temporal_channels", temporal_channels)),
+        )
+
+
+        self.scamc_gate = nn.Parameter(torch.tensor(float(
+            getattr(configs, "specam_fusion_gate_init", fusion_gate_init)
+        )))
+
+        self.global_feature_norm = nn.LayerNorm(32)
+        self.global_feature_dropout = nn.Dropout(float(
+            getattr(configs, "specam_global_dropout", 0.25)
+        ))
+
+
+        self.fc = nn.Linear(len(self.lead_indices_list) * 32 + 64, self.num_classes)
+
+    def forward(self, x):
+        raw_x = x
+        branch_outputs = []
+        for idx, (indices, branch) in enumerate(zip(self.lead_indices_list, self.lead_branches)):
+            input_x = x[:, indices, :]
+            self.original_x_list[idx] = input_x.detach()
+            out = branch(input_x)
+            branch_outputs.append(out)
+
+
+        pooled_outputs = [self.global_avg_pool(out) for out in branch_outputs]
+        base_feature = torch.cat(pooled_outputs, dim=1).flatten(start_dim=1)
+
+
+        regional_temporal_features = torch.stack(branch_outputs, dim=1)
+        cached_learnable_band_power = self.learnable_filterbank(raw_x)
+        scamc_feature, alignment, temporal_attention, montage_tokens = (
+            self.anatomy_montage_correspondence(
+                regional_temporal_features, raw_x, cached_learnable_band_power
+            )
+        )
+        self.last_regional_interactions = None
+        if self.training:
+            self.last_temporal_attention = None
+            self.last_anatomy_montage_alignment = None
+        else:
+            self.last_temporal_attention = temporal_attention.detach()
+            self.last_anatomy_montage_alignment = alignment.detach()
+
+
+        x = base_feature + self.scamc_gate * scamc_feature
+
+
+        global_feature = montage_tokens.mean(dim=(1, 2))
+        global_feature = self.global_feature_norm(global_feature)
+        global_feature = self.global_feature_dropout(global_feature)
+
+        x = self.dropout(x)
+        x = self.flatten(x)
+        x = torch.cat([x, global_feature], dim=1)
+        stroke_features = self._extract_stroke_spectral_features(
+            raw_x, band_power=cached_learnable_band_power
+        )
+        stroke_features = self.stroke_feature_proj(stroke_features)
+        x = torch.cat([x, stroke_features], dim=1)
+        x = self.fc(x)
+
+        scr_losses = []
+        for i in range(len(self.lead_indices_list)):
+            mid_feats = self.mid_features_list[i]
+            original_feats = self.original_x_list[i]
+            if mid_feats is not None:
+                scr_loss_i = self.compute_spectral_consistency_loss(
+                    mid_feats,
+                    original_feats,
+                    sample_rate_mid=self.sample_rate_mid,
+                    sample_rate_orig=self.sample_rate_orig,
+                )
+                scr_losses.append(scr_loss_i)
+            else:
+                scr_losses.append(torch.tensor(0.0, device=x.device))
+
+        scr_loss = torch.stack(scr_losses).mean()
+        return x, scr_loss
+
+
+class SpecAMNet(SpectralRegionFusion):
+
+
+    def __init__(self, configs=None):
+        super().__init__(configs=configs)
+
 
